@@ -1,0 +1,18 @@
+[package]
+name = "livtorgex_strategy"
+version = "1.0.0"
+authors = []
+
+[addresses]
+livtorgex='_'
+
+[dev-addresses]
+livtorgex='_'
+
+[dependencies]
+AptosFramework = { git = "https://github.com/aptos-labs/aptos-framework.git", subdir = "aptos-framework", rev = "mainnet" }
+AptosTokenObjects = { git = "https://github.com/aptos-labs/aptos-framework.git", subdir = "aptos-token-objects", rev = "mainnet" }
+AptosToken = { git = "https://github.com/aptos-labs/aptos-framework.git", subdir = "aptos-token", rev = "mainnet" }
+
+[dev-dependencies]
+
