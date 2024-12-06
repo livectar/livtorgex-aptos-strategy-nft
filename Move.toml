@@ -4,10 +4,12 @@ version = "1.0.0"
 authors = []
 
 [addresses]
-livtorgex='_'
+livtorgex="_"
+stablecoin="_"
 
 [dev-addresses]
-livtorgex='_'
+livtorgex="0xcafe"
+stablecoin="0xe7208512328c29c06e8f90b4644715e0819202fa8ca5facee917a9226efc5c78"
 
 [dependencies]
 AptosFramework = { git = "https://github.com/aptos-labs/aptos-framework.git", subdir = "aptos-framework", rev = "mainnet" }
