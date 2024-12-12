@@ -91,6 +91,24 @@ module livtorgex::strategy_events {
         borrow: address
     }
 
+    #[event]
+    struct ChangeEnergyRefillCapacity has drop, store {
+        strategy_addr: address,
+        name: String,
+        capacity: u64,
+        action: u64,
+        energy: u64
+    }
+
+    #[event]
+    struct RefillEnergy has drop, store {
+        strategy_addr: address,
+        name: String,
+        asset: address,
+        refill_energy: u64,
+        energy: u64
+    }
+
     public(friend) fun emit_create_strategy(
         strategy_addr: address, name: String, admin: address
     ) {
@@ -181,6 +199,30 @@ module livtorgex::strategy_events {
     ) {
         event::emit(
             UseStrategyNFT { strategy_addr, nft, energy, borrow }
+        );
+    }
+
+    public(friend) fun emit_change_energy_refill_capacity(
+        strategy_addr: address,
+        name: String,
+        capacity: u64,
+        action: u64,
+        energy: u64
+    ) {
+        event::emit(
+            ChangeEnergyRefillCapacity { strategy_addr, name, capacity, action, energy }
+        );
+    }
+
+    public(friend) fun emit_refill_energy(
+        strategy_addr: address,
+        name: String,
+        asset: address,
+        refill_energy: u64,
+        energy: u64
+    ) {
+        event::emit(
+            RefillEnergy { strategy_addr, name, asset, refill_energy, energy }
         );
     }
 }
