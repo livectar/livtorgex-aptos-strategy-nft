@@ -6,7 +6,6 @@ module livtorgex::strategy {
     use std::error;
     use std::vector;
     use std::string_utils;
-    use std::debug;
 
     use aptos_std::math64;
     use aptos_framework::object::{Self, Object};
@@ -19,7 +18,7 @@ module livtorgex::strategy {
     use aptos_framework::fungible_asset;
     use aptos_framework::primary_fungible_store;
 
-    use aptos_token_objects::token::{Self, Token};
+    use aptos_token_objects::token::{Self, Token, collection_object};
     use aptos_token_objects::collection;
     use aptos_token_objects::royalty;
 
@@ -47,9 +46,9 @@ module livtorgex::strategy {
     const NFT_ROLE_INDIVIDUAL: u64 = 0;
     const NFT_ROLE_COMPANY: u64 = 1;
 
-    // NFT Energy Request
-    const NFT_ENERGY_REQUEST_ADD: u64 = 0;
-    const NFT_ENERGY_REQUEST_SUBTRACT: u64 = 1;
+    // NFT Energy Refill Capacity Request
+    const NFT_ENERGY_REFILL_CAPACITY_REQUEST_ADD: u64 = 0;
+    const NFT_ENERGY_REFILL_CAPACITY_REQUEST_SUBTRACT: u64 = 1;
 
     // Request Status
     const REQUEST_STATUS_REJECT: u64 = 0;
@@ -85,6 +84,8 @@ module livtorgex::strategy {
     const ENFT_ENERGY_FULL: u64 = 102;
     /// NFT refill should use only stablecoins
     const ENFT_NOT_STABLECOIN: u64 = 103;
+    /// NFT does not have enough capacity to replenish energy
+    const ENFT_NOT_ENERGY_REFILL_CAPACITY: u64 = 104;
 
     #[resource_group_member(group = aptos_framework::object::ObjectGroup)]
     struct Management has key {
@@ -116,12 +117,12 @@ module livtorgex::strategy {
     // Struct to save NFT with precision 0.00001
     #[resource_group_member(group = aptos_framework::object::ObjectGroup)]
     struct StrategyNFT has key {
-        company_name: String,
+        company_code: String,
         trade_mode: u64,
         role: u64,
         energy: u64,
+        energy_refill_capacity: u64,
         profit: u64,
-        volume: u64,
         k_refill: u64,
         k_profit: u64,
         borrow: Option<address>
@@ -129,7 +130,6 @@ module livtorgex::strategy {
 
     #[resource_group_member(group = aptos_framework::object::ObjectGroup)]
     struct StrategyNFTLockup has key, drop {
-        is_active: bool,
         is_borrowed: bool,
         transfer_ref: object::TransferRef,
         mutator_ref: token::MutatorRef,
@@ -161,18 +161,45 @@ module livtorgex::strategy {
     }
 
     #[view]
-    public fun unpack_nft_properties(
-        token: Object<Token>
-    ): (String, u64, u64, u64, u64, u64) acquires StrategyNFT {
-        let nft = borrow_global_mut<StrategyNFT>(object::object_address(&token));
+    public fun unpack_strategy(
+        name: String
+    ): (address, String, String, u64, vector<address>, u64) acquires Management, Strategy {
+        let manager = borrow_global<Management>(@livtorgex);
+
+        let seed = bcs::to_bytes(&name);
+        let strategy_addr = create_resource_address(&manager.owner, seed);
+        assert!(
+            exists<Strategy>(strategy_addr),
+            error::not_found(ESTRATEGY_NOT_EXIST)
+        );
+        let strategy = borrow_global<Strategy>(strategy_addr);
 
         (
-            nft.company_name,
+            strategy_addr,
+            strategy.name,
+            strategy.version,
+            strategy.livtorgex_fee,
+            strategy.payment_coins,
+            strategy.total_minted
+        )
+    }
+
+    #[view]
+    public fun unpack_nft_properties(
+        token: Object<Token>
+    ): (String, u64, u64, u64, u64, u64, bool) acquires StrategyNFT, StrategyNFTLockup {
+        let nft_address = object::object_address(&token);
+        let nft = borrow_global<StrategyNFT>(nft_address);
+        let nft_lockup = borrow_global<StrategyNFTLockup>(nft_address);
+
+        (
+            nft.company_code,
             nft.trade_mode,
             nft.role,
             nft.energy,
             nft.k_refill,
-            nft.k_profit
+            nft.k_profit,
+            nft_lockup.is_borrowed
         )
     }
 
@@ -449,11 +476,11 @@ module livtorgex::strategy {
         );
     }
 
-    /// TODO: Add trade_mode
+    // Allow to mint NFT for strategy
     public entry fun mint_nfts(
         account: &signer,
         strategy_addr: address,
-        company_name: String,
+        company_code: String,
         trade_mode: u64,
         role: u64,
         description: String,
@@ -461,10 +488,11 @@ module livtorgex::strategy {
         size: u64,
         uri: String,
         energy: u64,
+        energy_refill_capacity: u64,
         k_refill: u64,
         k_profit: u64,
         community_address: Option<address>,
-        communite_fee: Option<u64>
+        community_fee: Option<u64>
     ) acquires Strategy {
         assert!(
             exists<Strategy>(strategy_addr),
@@ -477,10 +505,10 @@ module livtorgex::strategy {
         assert!(owner_addr == strategy.owner, error::permission_denied(EACCESS_DENIEND));
 
         let royalty =
-            if (option::is_some(&community_address) && option::is_some(&communite_fee)) {
+            if (option::is_some(&community_address) && option::is_some(&community_fee)) {
                 option::some(
                     royalty::create(
-                        *option::borrow<u64>(&communite_fee),
+                        *option::borrow<u64>(&community_fee),
                         NFT_REFILL_DENOMINATOR,
                         *option::borrow<address>(&community_address)
                     )
@@ -522,12 +550,12 @@ module livtorgex::strategy {
             move_to(
                 &token_signer,
                 StrategyNFT {
-                    company_name,
+                    company_code,
                     trade_mode,
                     role,
                     energy,
+                    energy_refill_capacity,
                     profit: 0,
-                    volume: 0,
                     k_refill,
                     k_profit,
                     borrow: option::none()
@@ -536,7 +564,6 @@ module livtorgex::strategy {
             move_to(
                 &token_signer,
                 StrategyNFTLockup {
-                    is_active: false,
                     is_borrowed: false,
                     transfer_ref,
                     mutator_ref: token::generate_mutator_ref(&constructor_ref),
@@ -546,7 +573,7 @@ module livtorgex::strategy {
 
             strategy_events::emit_mint_strategy_nft(
                 strategy_addr,
-                company_name,
+                company_code,
                 name,
                 description,
                 energy,
@@ -569,7 +596,6 @@ module livtorgex::strategy {
         let lockup = borrow_global_mut<StrategyNFTLockup>(object::object_address(&token));
 
         assert!(!lockup.is_borrowed, error::permission_denied(ETOKEN_IN_LOCKUP));
-        assert!(!lockup.is_active, error::permission_denied(ETOKEN_IN_LOCKUP));
 
         // generate linear transfer ref and transfer the token object
         let linear_transfer_ref =
@@ -584,13 +610,10 @@ module livtorgex::strategy {
             object::is_owner(token, signer::address_of(owner)),
             error::permission_denied(ENOT_TOKEN_OWNER)
         );
-        let StrategyNFTLockup {
-            is_active: _,
-            is_borrowed: _,
-            transfer_ref: _,
-            mutator_ref: _,
-            burn_ref
-        } = move_from<StrategyNFTLockup>(token_address);
+        let nft_lockup = borrow_global<StrategyNFTLockup>(token_address);
+        assert!(!nft_lockup.is_borrowed, error::permission_denied(ENFT_BORROWED));
+        let StrategyNFTLockup { is_borrowed: _, transfer_ref: _, mutator_ref: _, burn_ref } =
+            move_from<StrategyNFTLockup>(token_address);
 
         // Retrieve the burn ref from storage
         token::burn(burn_ref);
@@ -600,7 +623,13 @@ module livtorgex::strategy {
         account: &signer, token: Object<Token>
     ) acquires Strategy, StrategyNFT, StrategyNFTLockup {
         let nft_addr = object::object_address(&token);
-        let strategy = borrow_global<Strategy>(nft_addr);
+        let collection_object = collection_object(token);
+        let strategy_addr = collection::creator(collection_object);
+        assert!(
+            exists<Strategy>(strategy_addr),
+            error::not_found(ESTRATEGY_NOT_EXIST)
+        );
+        let strategy = borrow_global<Strategy>(strategy_addr);
         let nft = borrow_global_mut<StrategyNFT>(nft_addr);
         assert!(option::is_none(&nft.borrow), ENFT_BORROWED);
         assert!(
@@ -617,14 +646,15 @@ module livtorgex::strategy {
     }
 
     public entry fun release_nft(
-        account: &signer, strategy_addr: address, name: String
-    ) acquires Strategy, StrategyNFT, StrategyNFTLockup {
+        account: &signer, token: Object<Token>
+    ) acquires StrategyNFT, StrategyNFTLockup {
+        let nft_addr = object::object_address(&token);
+        let collection_object = collection_object(token);
+        let strategy_addr = collection::creator(collection_object);
         assert!(
             exists<Strategy>(strategy_addr),
             error::not_found(ESTRATEGY_NOT_EXIST)
         );
-        let strategy = borrow_global<Strategy>(strategy_addr);
-        let nft_addr = get_nft_address(&strategy_addr, &strategy.name, &name);
         let nft = borrow_global_mut<StrategyNFT>(nft_addr);
         assert!(option::is_some(&nft.borrow), ENFT_NOT_BORROW);
         assert!(
@@ -644,17 +674,15 @@ module livtorgex::strategy {
 
     // Spend the energy. Should be called from restricted accounts
     public entry fun use_nft_energy(
-        account: &signer,
-        strategy_addr: address,
-        name: String,
-        profit: u64
-    ) acquires Strategy, StrategyNFT, StrategyNFTLockup {
+        account: &signer, token: Object<Token>, profit: u64
+    ) acquires StrategyNFT, StrategyNFTLockup {
+        let nft_addr = object::object_address(&token);
+        let collection_object = collection_object(token);
+        let strategy_addr = collection::creator(collection_object);
         assert!(
             exists<Strategy>(strategy_addr),
             error::not_found(ESTRATEGY_NOT_EXIST)
         );
-        let strategy = borrow_global<Strategy>(strategy_addr);
-        let nft_addr = get_nft_address(&strategy_addr, &strategy.name, &name);
         let nft = borrow_global_mut<StrategyNFT>(nft_addr);
 
         assert!(option::is_some(&nft.borrow), ENFT_NOT_BORROW);
@@ -678,6 +706,14 @@ module livtorgex::strategy {
             nft.energy = nft.energy - energy_usage;
         };
 
+        if (energy_usage >= nft.energy_refill_capacity) {
+            nft.energy_refill_capacity = 0;
+        } else {
+            nft.energy_refill_capacity = nft.energy_refill_capacity - energy_usage;
+        };
+
+        nft.profit = nft.profit + profit;
+
         strategy_events::emit_use_strategy_nft(
             strategy_addr,
             nft_addr,
@@ -686,15 +722,59 @@ module livtorgex::strategy {
         );
     }
 
+    /// Change energy refill capacity for more or less usage
+    public entry fun change_energy_refill_capacity(
+        account: &signer,
+        token: Object<Token>,
+        capacity: u64,
+        action: u64
+    ) acquires Strategy, StrategyNFT {
+        let nft_addr = object::object_address(&token);
+        let collection_object = collection_object(token);
+        let strategy_addr = collection::creator(collection_object);
+        assert!(
+            exists<Strategy>(strategy_addr),
+            error::not_found(ESTRATEGY_NOT_EXIST)
+        );
+        let account_addr = signer::address_of(account);
+        let strategy = borrow_global<Strategy>(strategy_addr);
+        let nft = borrow_global_mut<StrategyNFT>(nft_addr);
+        assert!(
+            account_addr == strategy.owner || account_addr == strategy.livtorgex_owner,
+            error::permission_denied(EACCESS_DENIEND)
+        );
+
+        if (action == NFT_ENERGY_REFILL_CAPACITY_REQUEST_ADD) {
+            nft.energy_refill_capacity = nft.energy_refill_capacity + capacity;
+        };
+        if (action == NFT_ENERGY_REFILL_CAPACITY_REQUEST_SUBTRACT) {
+            if (nft.energy_refill_capacity > capacity) {
+                nft.energy_refill_capacity = nft.energy_refill_capacity - capacity;
+            } else {
+                nft.energy_refill_capacity = 0;
+            }
+        };
+
+        strategy_events::emit_change_energy_refill_capacity(
+            strategy_addr,
+            token::name(token),
+            capacity,
+            action,
+            nft.energy
+        );
+    }
+
     // Refill the energy
     // anyone can refill the energy
     public entry fun refill_energy<T: key>(
         account: &signer,
-        strategy_addr: address,
+        token: Object<Token>,
         asset: Object<T>,
-        name: String,
         energy: u64
     ) acquires Strategy, StrategyNFT {
+        let nft_addr = object::object_address(&token);
+        let collection_object = collection_object(token);
+        let strategy_addr = collection::creator(collection_object);
         assert!(
             exists<Strategy>(strategy_addr),
             error::not_found(ESTRATEGY_NOT_EXIST)
@@ -705,9 +785,13 @@ module livtorgex::strategy {
             vector::contains(&strategy.payment_coins, &object::object_address(&asset)),
             error::permission_denied(ENFT_NOT_STABLECOIN)
         );
-
-        let nft_addr = get_nft_address(&strategy_addr, &strategy.name, &name);
         let nft = borrow_global_mut<StrategyNFT>(nft_addr);
+
+        // Ensure that capacity enough to refill
+        assert!(
+            nft.energy_refill_capacity != 0,
+            error::resource_exhausted(ENFT_NOT_ENERGY_REFILL_CAPACITY)
+        );
 
         let refill_energy =
             if (energy + nft.energy > NFT_MAX_ENERGY) {
@@ -721,12 +805,21 @@ module livtorgex::strategy {
         let expo_magnitude = NFT_REFILL_DENOMINATOR / stablecoin_denominator;
 
         // Just to 1to1 rate. Specify any tokens in the is_allowed_coin_type that can use for stable coin
-        let full_amount = NFT_REFILL_DENOMINATOR / nft.k_refill * NFT_REFILL_DENOMINATOR;
+        let full_amount = NFT_REFILL_DENOMINATOR / nft.k_refill
+            * NFT_REFILL_DENOMINATOR;
         let refill_amount = bounded_percentage(full_amount, energy, NFT_PRECISION * 100);
         let initial_amount: u64 = refill_amount / expo_magnitude;
 
-        let livtorgex_amount = bounded_percentage(initial_amount, strategy.livtorgex_fee, NFT_REFILL_DENOMINATOR);
-        primary_fungible_store::transfer(account, asset, strategy.livtorgex_owner, livtorgex_amount);
+        let livtorgex_amount =
+            bounded_percentage(
+                initial_amount, strategy.livtorgex_fee, NFT_REFILL_DENOMINATOR
+            );
+        primary_fungible_store::transfer(
+            account,
+            asset,
+            strategy.livtorgex_owner,
+            livtorgex_amount
+        );
 
         let owner_amount = initial_amount - livtorgex_amount;
 
@@ -737,8 +830,12 @@ module livtorgex::strategy {
             let numerator = royalty::numerator(&royalty);
             let denominator = royalty::denominator(&royalty);
 
-            let royalty_amount = bounded_percentage(initial_amount, numerator, denominator);
-            primary_fungible_store::transfer(account, asset, payee_address, royalty_amount);
+            let royalty_amount = bounded_percentage(
+                initial_amount, numerator, denominator
+            );
+            primary_fungible_store::transfer(
+                account, asset, payee_address, royalty_amount
+            );
 
             owner_amount = owner_amount - royalty_amount;
         };
@@ -746,6 +843,14 @@ module livtorgex::strategy {
         primary_fungible_store::transfer(account, asset, strategy.owner, owner_amount);
 
         nft.energy = nft.energy + refill_energy;
+
+        strategy_events::emit_refill_energy(
+            strategy_addr,
+            token::name(token),
+            object::object_address(&asset),
+            refill_energy,
+            nft.energy
+        );
     }
 
     inline fun get_nft_address(
@@ -754,11 +859,15 @@ module livtorgex::strategy {
         token::create_token_address(creator, collection, name)
     }
 
-    public inline fun bounded_percentage(amount: u64, numerator: u64, denominator: u64): u64 {
-        if (denominator == 0) {
-            0
-        } else {
-            math64::min(amount, math64::mul_div(amount, numerator, denominator))
+    public inline fun bounded_percentage(
+        amount: u64, numerator: u64, denominator: u64
+    ): u64 {
+        if (denominator == 0) { 0 }
+        else {
+            math64::min(
+                amount,
+                math64::mul_div(amount, numerator, denominator)
+            )
         }
     }
 
@@ -785,7 +894,7 @@ module livtorgex::strategy {
 
     #[test_only]
     fun create_test_nfts(account: &signer, strategy_addr: address): (String, u64) acquires Strategy {
-        let company_name = string::utf8(b"LivTorgEx");
+        let company_code = string::utf8(b"LivTorgEx");
         let nft_name = string::utf8(b"Subscription");
         let uri = string::utf8(b"https:://livtorgex.com");
         let description = string::utf8(b"Test NFT for subscription");
@@ -796,7 +905,7 @@ module livtorgex::strategy {
         mint_nfts(
             account,
             strategy_addr,
-            company_name,
+            company_code,
             0,
             NFT_ROLE_INDIVIDUAL,
             description,
@@ -804,6 +913,7 @@ module livtorgex::strategy {
             1,
             uri,
             energy,
+            NFT_PRECISION * 1000,
             k_refill,
             k_profit,
             option::none(),
@@ -823,10 +933,7 @@ module livtorgex::strategy {
         // let (mint_ref, _, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let account_store = fungible_asset::create_test_store(account, metadata);
         let fa = fungible_asset::mint(&mint_ref, 10);
-        debug::print(&fa);
         fungible_asset::deposit(account_store, fa);
-
-        debug::print(&object::object_address(&metadata));
 
         strategy_change_payment_coins(
             account, strategy_addr, vector[object::object_address(&metadata)]
@@ -881,19 +988,14 @@ module livtorgex::strategy {
         let strategy_addr = create_test_strategy(account);
         create_test_nfts(account, strategy_addr);
         let metadata = assign_fa_to_strategy(account, strategy_addr);
+        let nft_address = get_nft_address(&strategy_addr, &name, &nft_name);
+        let nft = object::address_to_object<Token>(nft_address);
 
-        refill_energy(
-            account,
-            strategy_addr,
-            metadata,
-            nft_name,
-            fill_energy
-        );
+        refill_energy(account, nft, metadata, fill_energy);
 
-        // let nft_address = get_nft_address(&strategy_addr, &name, &nft_name);
-        // let nft = borrow_global<StrategyNFT>(nft_address);
+        let nft = borrow_global<StrategyNFT>(nft_address);
 
-        // assert!(nft.energy == initial_energy + fill_energy, 100);
+        assert!(nft.energy == initial_energy + fill_energy, 100);
 
     }
 }
